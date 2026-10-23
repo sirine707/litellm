@@ -2070,6 +2070,61 @@ class TestFetchAllMCPServersOrdering:
         assert "Restricted virtual key" in str(exc_info.value.detail)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "grants", "allowed_routes", "expected"),
+    [
+        (LitellmUserRoles.INTERNAL_USER, ["visible"], [], ["shared-group", "visible-group"]),
+        (LitellmUserRoles.INTERNAL_USER, [], [], []),
+        (LitellmUserRoles.INTERNAL_USER, ["visible"], ["/v1/mcp/access_groups"], []),
+        (LitellmUserRoles.PROXY_ADMIN, None, [], ["private-group", "shared-group", "visible-group"]),
+    ],
+)
+async def test_access_groups_only_lists_groups_of_servers_the_caller_can_see(
+    role: LitellmUserRoles,
+    grants: list[str] | None,
+    allowed_routes: list[str],
+    expected: list[str],
+) -> None:
+    from litellm.proxy._experimental.mcp_server import mcp_server_manager
+
+    manager: Final = mcp_server_manager.MCPServerManager()
+    manager.config_mcp_servers = {
+        server_id: MCPServer(
+            server_id=server_id,
+            name=server_id,
+            url=f"https://mcp.example.com/{server_id}",
+            transport=MCPTransport.http,
+            auth_type=MCPAuth.none,
+            access_groups=groups,
+        )
+        for server_id, groups in (
+            ("visible", ["visible-group", "shared-group"]),
+            ("private", ["private-group", "shared-group"]),
+        )
+    }
+    caller: Final = UserAPIKeyAuth(
+        user_role=role,
+        api_key="sk-access-groups-caller",
+        allowed_routes=allowed_routes,
+        object_permission=None
+        if grants is None
+        else LiteLLM_ObjectPermissionTable(object_permission_id="access-groups-caller", mcp_servers=grants),
+    )
+    with (
+        patch.object(  # test-quality-ok: TQ008 inject real registry into legacy route binding
+            mgmt_endpoints, "global_mcp_server_manager", manager
+        ),
+        patch.object(  # test-quality-ok: TQ008 inject shared registry without mocking permission policy
+            mcp_server_manager, "global_mcp_server_manager", manager
+        ),
+        patch("litellm.proxy.proxy_server.prisma_client", None),  # test-quality-ok: TQ008 config-only proxy
+    ):
+        result: Final = await mgmt_endpoints.get_mcp_access_groups(user_api_key_dict=caller)
+
+    assert result == {"access_groups": expected}, f"{role} granted {grants} saw {result}"
+
+
 class TestTemporaryMCPSessionEndpoints:
     def test_inherit_credentials_from_existing_server(self):
         payload = NewMCPServerRequest(
